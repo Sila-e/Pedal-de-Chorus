@@ -1,0 +1,125 @@
+#include <Audio.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <math.h>
+
+// Pines
+#define POT_DEPTH_PIN      A1
+#define POT_SPEED_PIN      A2
+#define POT_MIX_PIN        A4
+#define POT_SHAPE_PIN      A3  // Control nuevo para forma LFO dividida en 4
+
+// Audio objetos
+AudioInputI2S audioInput;          // Entrada mic/linea AudioShield
+AudioEffectChorus monoChorus;
+AudioMixer4 monoMixer;
+AudioOutputI2S audioOutput;
+AudioControlSGTL5000 sgtl5000_1;
+
+#define CHORUS_DELAY_LENGTH (16 * AUDIO_BLOCK_SAMPLES)
+short mono_delayline[CHORUS_DELAY_LENGTH];
+
+// Conexiones
+AudioConnection patchCord1(audioInput, 0, monoChorus, 0);
+AudioConnection patchCord2(audioInput, 0, monoMixer, 0);       // Dry
+AudioConnection patchCord3(monoChorus, 0, monoMixer, 1);      // Wet
+AudioConnection patchCord4(monoMixer, 0, audioOutput, 0);
+AudioConnection patchCord5(monoMixer, 0, audioOutput, 1);
+
+// Variables para LFO
+elapsedMillis lfoTimer;
+float lfoPhase = 0.0;
+const float LFO_UPDATE_MS = 10.0;
+
+enum LFOShape { SINE, TRIANGLE, SQUARE, SAWTOOTH };
+
+// Últimos valores leídos
+float lastDepth = -1.0;
+float lastSpeed = -1.0;
+float lastMix = -1.0;
+int lastShapeIndex = -1;
+
+float getLFOValue(float phase, LFOShape shape) {
+  switch (shape) {
+    case SINE:
+      return sinf(phase);
+    case TRIANGLE: {
+      float p = phase / (2.0f * PI);
+      return 1.0f - 4.0f * fabsf(roundf(p) - p);
+    }
+    case SQUARE:
+      return (fmodf(phase, 2.0f * PI) < PI) ? 1.0f : -1.0f;
+    case SAWTOOTH:
+      return (phase / (2.0f * PI)) * 2.0f - 1.0f;
+    default:
+      return 0.0f;
+  }
+}
+
+void updateChorusLFO(float depth, float speedHz, LFOShape shape) {
+  if (lfoTimer >= LFO_UPDATE_MS) {
+    lfoTimer = 0;
+
+    const float depthMs = depth * 20.0f;
+    const int baseDelay = 10;
+
+    float mod = getLFOValue(lfoPhase, shape);
+    int delay = constrain(baseDelay + mod * depthMs, 1, 40);
+
+    lfoPhase += (2.0f * PI * speedHz) * (LFO_UPDATE_MS / 1000.0f);
+    if (lfoPhase > 2.0f * PI) lfoPhase -= 2.0f * PI;
+
+    AudioNoInterrupts();
+    monoChorus.begin(mono_delayline, CHORUS_DELAY_LENGTH, delay);
+    AudioInterrupts();
+  }
+}
+
+void updateMix(float mix) {
+  mix = constrain(mix, 0.0, 1.0);
+  float dryLevel = 1.0 - mix;
+  float wetLevel = mix;
+
+  monoMixer.gain(0, dryLevel);
+  monoMixer.gain(1, wetLevel);
+}
+
+void setup() {
+  Serial.begin(9600);
+  delay(1000);
+
+  AudioMemory(60);
+  sgtl5000_1.enable();
+  sgtl5000_1.inputSelect(AUDIO_INPUT_MIC);
+  sgtl5000_1.volume(0.7);
+
+  Serial.println("🎸 Pedal Chorus Mono con entrada MIC listo");
+}
+
+void loop() {
+  float depth = analogRead(POT_DEPTH_PIN) / 1023.0;
+  float speedRaw = analogRead(POT_SPEED_PIN) / 1023.0;
+  float speed = 0.1 + powf(speedRaw, 2.2) * 4.0;
+  float mix = analogRead(POT_MIX_PIN) / 1023.0;
+  float shapeRaw = analogRead(POT_SHAPE_PIN) / 1023.0;
+
+  int shapeIndex = (int)(shapeRaw * 4.0);
+  if (shapeIndex > 3) shapeIndex = 3;
+  LFOShape currentShape = (LFOShape)shapeIndex;
+
+  if (abs(depth - lastDepth) > 0.01 || abs(speed - lastSpeed) > 0.01 ||
+      abs(mix - lastMix) > 0.01 || shapeIndex != lastShapeIndex) {
+
+    updateChorusLFO(depth, speed, currentShape);
+    updateMix(mix);
+
+    Serial.printf("🎛️ Depth: %.2f | Speed: %.2f Hz | Mix: %.2f | Shape: %s\n",
+      depth, speed, mix,
+      (shapeIndex == 0 ? "SINE" : (shapeIndex == 1 ? "TRIANGLE" : (shapeIndex == 2 ? "SQUARE" : "SAWTOOTH"))));
+
+    lastDepth = depth;
+    lastSpeed = speed;
+    lastMix = mix;
+    lastShapeIndex = shapeIndex;
+  }
+}
